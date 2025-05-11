@@ -1,0 +1,211 @@
+import os
+import numpy as np
+import pandas as pd
+from PIL import Image
+from random import shuffle
+
+# 超参数配置
+IMAGE_SIZE = 448
+GRID_SIZE = 7
+NUM_BBOX = 2
+NUM_CLASSES = 20
+LEARNING_RATE = 0.001
+BATCH_SIZE = 4
+EPOCHS = 50
+LAMBDA_COORD = 5
+LAMBDA_NOOBJ = 0.5
+
+# 数据加载函数
+def load_data(data_dir, label_dir):
+    images = []
+    labels = []
+    
+    for file in os.listdir(data_dir):
+        if not file.endswith(".jpg"):
+            continue
+            
+        # 加载图像
+        img_path = os.path.join(data_dir, file)
+        image = Image.open(img_path).resize((IMAGE_SIZE, IMAGE_SIZE))
+        images.append(np.array(image)/255.0)
+        
+        # 加载标签
+        txt_path = os.path.join(label_dir, file.replace(".jpg", ".txt"))
+        label_matrix = np.zeros((GRID_SIZE, GRID_SIZE, 5 + NUM_CLASSES))
+        
+        if os.path.exists(txt_path):
+            with open(txt_path) as f:
+                for line in f.readlines():
+                    class_id, x, y, w, h = map(float, line.strip().split())
+                    
+                    # 计算网格位置
+                    grid_x = int(x * GRID_SIZE)
+                    grid_y = int(y * GRID_SIZE)
+                    
+                    # 转换为网格相对坐标
+                    rel_x = x * GRID_SIZE - grid_x
+                    rel_y = y * GRID_SIZE - grid_y
+                    
+                    # 填充标签矩阵
+                    label_matrix[grid_y, grid_x, 0] = 1  # 存在物体
+                    label_matrix[grid_y, grid_x, 1:5] = [rel_x, rel_y, w, h]
+                    label_matrix[grid_y, grid_x, 5 + int(class_id)] = 1
+                    
+        labels.append(label_matrix)
+    
+    return np.array(images), np.array(labels)
+
+# 简化模型实现
+class SimpleYOLOv1:
+    def __init__(self):
+        self.fc1 = np.random.randn(3*IMAGE_SIZE*IMAGE_SIZE, 1470) * 0.01
+        self.bias = np.zeros(1470)
+        
+    def forward(self, x):
+        x_flatten = x.reshape(-1, 3*IMAGE_SIZE*IMAGE_SIZE)
+        return np.dot(x_flatten, self.fc1) + self.bias
+
+# IOU计算函数
+def calculate_iou(box1, box2):
+    # box: [x_center, y_center, width, height]
+    box1 = [
+        box1[0] - box1[2]/2,  # x1
+        box1[1] - box1[3]/2,  # y1
+        box1[0] + box1[2]/2,  # x2
+        box1[1] + box1[3]/2   # y2
+    ]
+    
+    box2 = [
+        box2[0] - box2[2]/2,
+        box2[1] - box2[3]/2,
+        box2[0] + box2[2]/2,
+        box2[1] + box2[3]/2
+    ]
+    
+    # 计算交集区域
+    x_left = max(box1[0], box2[0])
+    y_top = max(box1[1], box2[1])
+    x_right = min(box1[2], box2[2])
+    y_bottom = min(box1[3], box2[3])
+    
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+    
+    intersection = (x_right - x_left) * (y_bottom - y_top)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    return intersection / (area1 + area2 - intersection + 1e-6)
+
+# 损失函数
+def yolo_loss(predictions, labels):
+    loss = 0.0
+    
+    for b in range(BATCH_SIZE):
+        pred = predictions[b].reshape(GRID_SIZE, GRID_SIZE, 30)
+        label = labels[b]
+        
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                # 解析预测值
+                bbox1 = pred[i,j,:5]
+                bbox2 = pred[i,j,5:10]
+                class_pred = pred[i,j,10:]
+                
+                # 解析标签
+                has_obj = label[i,j,0]
+                true_box = label[i,j,1:5]
+                true_class = label[i,j,5:]
+                
+                # 类别损失
+                if has_obj:
+                    loss += np.sum((class_pred - true_class)**2)
+                
+                # 计算IOU
+                if has_obj:
+                    # 转换为绝对坐标
+                    cell_size = IMAGE_SIZE/GRID_SIZE
+                    pred_box1 = [
+                        (j + bbox1[0]) * cell_size,
+                        (i + bbox1[1]) * cell_size,
+                        bbox1[2] * IMAGE_SIZE,
+                        bbox1[3] * IMAGE_SIZE
+                    ]
+                    pred_box2 = [
+                        (j + bbox2[0]) * cell_size,
+                        (i + bbox2[1]) * cell_size,
+                        bbox2[2] * IMAGE_SIZE,
+                        bbox2[3] * IMAGE_SIZE
+                    ]
+                    true_box_abs = [
+                        (j + true_box[0]) * cell_size,
+                        (i + true_box[1]) * cell_size,
+                        true_box[2] * IMAGE_SIZE,
+                        true_box[3] * IMAGE_SIZE
+                    ]
+                    
+                    iou1 = calculate_iou(pred_box1, true_box_abs)
+                    iou2 = calculate_iou(pred_box2, true_box_abs)
+                    best_idx = np.argmax([iou1, iou2])
+                    
+                    # 坐标损失
+                    if best_idx == 0:
+                        loss += LAMBDA_COORD * np.sum((bbox1[:2] - true_box[:2])**2)
+                        loss += LAMBDA_COORD * np.sum((np.sqrt(bbox1[2:4]) - np.sqrt(true_box[2:4]))**2)
+                        conf_loss = (bbox1[4] - iou1)**2
+                    else:
+                        loss += LAMBDA_COORD * np.sum((bbox2[:2] - true_box[:2])**2)
+                        loss += LAMBDA_COORD * np.sum((np.sqrt(bbox2[2:4]) - np.sqrt(true_box[2:4]))**2)
+                        conf_loss = (bbox2[4] - iou2)**2
+                    
+                    # 置信度损失
+                    loss += conf_loss
+                    loss += LAMBDA_NOOBJ * ((bbox1[4] if best_idx !=0 else bbox2[4]) - 0)**2
+                
+                else:  # 无物体
+                    loss += LAMBDA_NOOBJ * np.sum((bbox1[4])**2)
+                    loss += LAMBDA_NOOBJ * np.sum((bbox2[4])**2)
+    
+    return loss / BATCH_SIZE
+
+# 训练流程
+def train():
+    # 初始化模型
+    model = SimpleYOLOv1()
+    
+    # 加载数据
+    images, labels = load_data("train", "labels")
+    
+    # 训练循环
+    for epoch in range(EPOCHS):
+        # 打乱数据
+        indices = list(range(len(images)))
+        shuffle(indices)
+        
+        total_loss = 0
+        for i in range(0, len(images), BATCH_SIZE):
+            # 获取批次数据
+            batch_indices = indices[i:i+BATCH_SIZE]
+            batch_images = images[batch_indices]
+            batch_labels = labels[batch_indices]
+            
+            # 前向传播
+            preds = model.forward(batch_images)
+            
+            # 计算损失
+            loss = yolo_loss(preds, batch_labels)
+            total_loss += loss
+            
+            # 反向传播（简化版梯度下降）
+            # 注意：这里使用数值梯度近似，实际应计算解析梯度
+            eps = 1e-5
+            grad = np.zeros_like(model.fc1)
+            
+            # 参数更新（这里仅示意，实际需要计算真实梯度）
+            model.fc1 -= LEARNING_RATE * grad
+            model.bias -= LEARNING_RATE * np.zeros_like(model.bias)
+            
+        print(f"Epoch {epoch+1}, Loss: {total_loss/len(images)}")
+
+if __name__ == "__main__":
+    train()
